@@ -20,9 +20,13 @@ import (
 )
 
 var (
-	ErrFileRequired      = errors.New("file is required")
-	ErrObjectKeyRequired = errors.New("object key is required")
-	ErrFileTooLarge      = errors.New("file exceeds configured max size")
+	ErrFileRequired        = errors.New("file is required")
+	ErrObjectKeyRequired   = errors.New("object key is required")
+	ErrFileTooLarge        = errors.New("file exceeds configured max size")
+	ErrOneTimeLinkNotFound = errors.New("one-time upload link not found")
+	ErrOneTimeLinkExpired  = errors.New("one-time upload link expired")
+	ErrOneTimeLinkConsumed = errors.New("one-time upload link already used")
+	ErrInvalidExpiry       = errors.New("expires_in_minutes must be between 1 and 1440")
 )
 
 type UploadFile interface {
@@ -65,6 +69,7 @@ type Service struct {
 	storageClass string
 	cfg          config.UploadConfig
 	tracker      *Tracker
+	oneTimeLinks *oneTimeLinkStore
 	logger       *zap.Logger
 	wg           sync.WaitGroup
 }
@@ -78,6 +83,7 @@ func NewService(client *s3client.Client, uploadCfg config.UploadConfig, s3Cfg co
 		storageClass: strings.TrimSpace(s3Cfg.StorageClass),
 		cfg:          uploadCfg,
 		tracker:      NewTracker(),
+		oneTimeLinks: newOneTimeLinkStore(),
 		logger:       logger,
 	}
 }
@@ -189,6 +195,53 @@ func (s *Service) GeneratePresignedUploadURL(ctx context.Context, key, contentTy
 		Key:       objectKey,
 		ExpiresAt: time.Now().UTC().Add(expires),
 	}, nil
+}
+
+func (s *Service) CreateOneTimeUploadLink(baseURL, key, contentType string, expiresInMinutes int) (OneTimeLinkResult, error) {
+	normalizedBaseURL := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if normalizedBaseURL == "" {
+		return OneTimeLinkResult{}, fmt.Errorf("base url is required")
+	}
+
+	if expiresInMinutes < 0 || expiresInMinutes > 1440 {
+		return OneTimeLinkResult{}, ErrInvalidExpiry
+	}
+
+	expires := defaultOneTimeLinkExpiry
+	if expiresInMinutes > 0 {
+		expires = time.Duration(expiresInMinutes) * time.Minute
+	}
+	if expires > maxOneTimeLinkExpiry {
+		return OneTimeLinkResult{}, ErrInvalidExpiry
+	}
+
+	fallbackFilename := "upload-" + uuid.NewString()
+	objectKey := s.normalizeObjectKey(key, fallbackFilename)
+	if objectKey == "" {
+		return OneTimeLinkResult{}, ErrObjectKeyRequired
+	}
+
+	expiresAt := time.Now().UTC().Add(expires)
+	token, err := s.oneTimeLinks.create(objectKey, contentType, expiresAt)
+	if err != nil {
+		return OneTimeLinkResult{}, fmt.Errorf("create one-time upload link: %w", err)
+	}
+
+	return OneTimeLinkResult{
+		Token:     token,
+		URL:       normalizedBaseURL + "/upload/one-time/" + token,
+		Key:       objectKey,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func (s *Service) ConsumeOneTimeUploadLink(token string) (OneTimeLinkPayload, error) {
+	link, err := s.oneTimeLinks.consume(token, time.Now())
+	if err != nil {
+		return OneTimeLinkPayload{}, err
+	}
+
+	return link, nil
 }
 
 func (s *Service) GetStatus(uploadID string) (UploadStatus, bool) {

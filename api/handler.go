@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,6 +28,12 @@ type Handler struct {
 }
 
 type presignRequest struct {
+	Key              string `json:"key"`
+	ContentType      string `json:"content_type"`
+	ExpiresInMinutes int    `json:"expires_in_minutes"`
+}
+
+type oneTimeLinkRequest struct {
 	Key              string `json:"key"`
 	ContentType      string `json:"content_type"`
 	ExpiresInMinutes int    `json:"expires_in_minutes"`
@@ -51,11 +59,13 @@ func (h *Handler) Router() http.Handler {
 	r.Use(h.requestLogger)
 
 	r.Get("/healthz", h.health)
+	r.Put("/upload/one-time/{token}", h.uploadWithOneTimeLink)
 
 	r.Group(func(router chi.Router) {
 		router.Use(appmiddleware.NewAuthMiddleware(h.cfg.Security, h.logger))
 		router.Post("/upload", h.uploadFile)
 		router.Post("/upload/presign", h.presignUpload)
+		router.Post("/upload/one-time/link", h.createOneTimeUploadLink)
 		router.Get("/upload/{upload_id}/status", h.uploadStatus)
 		router.Delete("/upload/{upload_id}", h.abortUpload)
 	})
@@ -163,6 +173,98 @@ func (h *Handler) presignUpload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+func (h *Handler) createOneTimeUploadLink(w http.ResponseWriter, r *http.Request) {
+	var request oneTimeLinkRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	result, err := h.uploader.CreateOneTimeUploadLink(
+		requestBaseURL(r),
+		request.Key,
+		request.ContentType,
+		request.ExpiresInMinutes,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, uploader.ErrInvalidExpiry):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, uploader.ErrObjectKeyRequired):
+			writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			h.logger.Error("failed creating one-time upload link", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to create one-time link")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) uploadWithOneTimeLink(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(chi.URLParam(r, "token"))
+	if token == "" {
+		writeError(w, http.StatusBadRequest, "token is required")
+		return
+	}
+
+	link, err := h.uploader.ConsumeOneTimeUploadLink(token)
+	if err != nil {
+		switch {
+		case errors.Is(err, uploader.ErrOneTimeLinkNotFound):
+			writeError(w, http.StatusNotFound, "one-time link not found")
+		case errors.Is(err, uploader.ErrOneTimeLinkExpired):
+			writeError(w, http.StatusGone, "one-time link expired")
+		case errors.Is(err, uploader.ErrOneTimeLinkConsumed):
+			writeError(w, http.StatusConflict, "one-time link already used")
+		default:
+			h.logger.Error("failed consuming one-time upload link", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to validate one-time link")
+		}
+		return
+	}
+
+	tempFile, size, err := copyBodyToTempFile(r.Body, h.cfg.Upload.MaxFileSizeBytes())
+	if err != nil {
+		if errors.Is(err, uploader.ErrFileTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	defer func() {
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
+	}()
+
+	contentType := strings.TrimSpace(link.ContentType)
+	if contentType == "" {
+		contentType = strings.TrimSpace(r.Header.Get("Content-Type"))
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	result, err := h.uploader.Upload(r.Context(), uploader.UploadRequest{
+		File:        tempFile,
+		Filename:    filepath.Base(link.ObjectKey),
+		ContentType: contentType,
+		ObjectKey:   link.ObjectKey,
+		Size:        size,
+	})
+	if err != nil {
+		h.handleUploadError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
 func (h *Handler) uploadStatus(w http.ResponseWriter, r *http.Request) {
 	uploadID := strings.TrimSpace(chi.URLParam(r, "upload_id"))
 	if uploadID == "" {
@@ -230,12 +332,84 @@ func (h *Handler) requestLogger(next http.Handler) http.Handler {
 		h.logger.Info("http request",
 			zap.String("request_id", chimw.GetReqID(r.Context())),
 			zap.String("method", r.Method),
-			zap.String("path", r.URL.Path),
+			zap.String("path", sanitizePathForLog(r.URL.Path)),
 			zap.Int("status", ww.Status()),
 			zap.Int("bytes", ww.BytesWritten()),
 			zap.Duration("duration", time.Since(startedAt)),
 		)
 	})
+}
+
+func copyBodyToTempFile(body io.ReadCloser, maxBytes int64) (*os.File, int64, error) {
+	if body == nil {
+		return nil, 0, fmt.Errorf("request body is required")
+	}
+	defer body.Close()
+
+	tempFile, err := os.CreateTemp("", "onetime-upload-*")
+	if err != nil {
+		return nil, 0, fmt.Errorf("create temporary file: %w", err)
+	}
+
+	written, err := io.Copy(tempFile, io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
+		return nil, 0, fmt.Errorf("read request body: %w", err)
+	}
+
+	if written == 0 {
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
+		return nil, 0, fmt.Errorf("request body is empty")
+	}
+
+	if written > maxBytes {
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
+		return nil, 0, fmt.Errorf("%w: max %d bytes", uploader.ErrFileTooLarge, maxBytes)
+	}
+
+	if _, err := tempFile.Seek(0, io.SeekStart); err != nil {
+		_ = tempFile.Close()
+		_ = os.Remove(tempFile.Name())
+		return nil, 0, fmt.Errorf("seek temporary file: %w", err)
+	}
+
+	return tempFile, written, nil
+}
+
+func sanitizePathForLog(path string) string {
+	if strings.HasPrefix(path, "/upload/one-time/") {
+		return "/upload/one-time/{token}"
+	}
+	return path
+}
+
+func requestBaseURL(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+
+	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		if r.TLS != nil {
+			proto = "https"
+		} else {
+			proto = "http"
+		}
+	}
+
+	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(r.Host)
+	}
+
+	if host == "" {
+		return ""
+	}
+
+	return proto + "://" + host
 }
 
 func writeError(w http.ResponseWriter, statusCode int, message string) {

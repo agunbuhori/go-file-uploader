@@ -13,6 +13,7 @@ A production-ready Go service for uploading large files to Amazon S3 using **mul
 | Auto-detect Mode | Automatically selects upload strategy based on file size |
 | Retry + Backoff | Failed uploads are retried with exponential backoff |
 | Presigned URL | Generate temporary URLs for download/upload without exposing credentials |
+| One-Time Upload Link | Generate single-use upload links that auto-expire and reject replay |
 | Structured Logging | JSON logs via `zap` with request tracing |
 | Security | TLS enforcement, credential isolation via `.env`, IAM-scoped access |
 | Progress Tracking | Real-time upload progress per chunk |
@@ -149,11 +150,13 @@ go build -o bin/go-s3-uploader ./cmd/server
 
 ## 📡 API Reference
 
-All endpoints require authentication. Pass the API key as a header:
+Management endpoints require authentication. Pass the API key as a header:
 
 ```
 Authorization: Bearer <your-api-key>
 ```
+
+One-time upload links are token-authenticated and intentionally do **not** require API key/JWT.
 
 ---
 
@@ -219,6 +222,73 @@ Returns a time-limited URL the client can use to upload directly to S3 — no se
   "expires_at": "2024-11-01T12:15:00Z"
 }
 ```
+
+---
+
+### `POST /upload/one-time/link` — Generate one-time upload link
+
+Creates a single-use upload URL that can be used exactly once. The token is consumed on first request attempt and cannot be reused.
+
+**Request body** — `application/json`
+
+```json
+{
+  "key": "uploads/onetime/video.mp4",
+  "content_type": "video/mp4",
+  "expires_in_minutes": 15
+}
+```
+
+**Response `200 OK`**
+
+```json
+{
+  "token": "G2JxqVQ6x...",
+  "url": "http://localhost:8080/upload/one-time/G2JxqVQ6x...",
+  "key": "uploads/onetime/video.mp4",
+  "expires_at": "2024-11-01T12:15:00Z"
+}
+```
+
+**Errors**
+
+- `400` invalid request or expiry out of range (`1..1440` minutes)
+- `401` unauthorized management request
+
+---
+
+### `PUT /upload/one-time/:token` — Upload using one-time link
+
+Uploads binary content through a single-use token URL. This endpoint does **not** require API key/JWT.
+
+```bash
+curl -X PUT "http://localhost:8080/upload/one-time/G2JxqVQ6x..." \
+  -H "Content-Type: video/mp4" \
+  --data-binary "@/path/to/video.mp4"
+```
+
+**Response `200 OK`**
+
+```json
+{
+  "success": true,
+  "key": "uploads/onetime/video.mp4",
+  "bucket": "your-bucket-name",
+  "etag": "abc123def456",
+  "size_bytes": 104857600,
+  "upload_id": "upload_01HXYZ...",
+  "strategy": "multipart",
+  "chunks": 10,
+  "duration_ms": 4120
+}
+```
+
+**Errors**
+
+- `404` token not found
+- `410` token expired
+- `409` token already used
+- `413` file exceeds configured max upload size
 
 ---
 
